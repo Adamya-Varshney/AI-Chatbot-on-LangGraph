@@ -1,6 +1,6 @@
 [theme]
-base = "light"
-primaryColor = "#5B9BD5"             # blue accent — focus, selection, send button
-backgroundColor = "#F3F1EA"          # dirty white — main canvas (unchanged)
-secondaryBackgroundColor = "#16243F" # deep navy — sidebar & input fills
-textColor = "#2C3A39"                # dark slate — for the light main canvas
+base = "dark"
+primaryColor = "#E8734A"
+backgroundColor = "#0F1B2D"
+secondaryBackgroundColor = "#162236"
+textColor = "#E8ECF1"
