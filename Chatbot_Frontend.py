@@ -1,6 +1,11 @@
 import streamlit as st
-from Chatbot_Backend import chatbot, generate_title   # <-- import the helper
-from langchain_core.messages import HumanMessage, AIMessage
+from Chatbot_Backend import (
+    chatbot,
+    generate_title,
+    ingest_pdf,
+    thread_document_metadata,
+)
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo, available_timezones
@@ -188,7 +193,7 @@ if 'thread_id' not in st.session_state:
 if 'chat_threads' not in st.session_state:
     st.session_state['chat_threads'] = []
 
-if 'chat_titles' not in st.session_state:          # <-- NEW: thread_id -> title
+if 'chat_titles' not in st.session_state:
     st.session_state['chat_titles'] = {}
 
 if 'user_location' not in st.session_state:
@@ -196,25 +201,58 @@ if 'user_location' not in st.session_state:
 if 'user_timezone' not in st.session_state:
     st.session_state['user_timezone'] = 'Asia/Kolkata'
 if 'settings_expanded' not in st.session_state:
-    st.session_state['settings_expanded'] = True   # open until first save
-    
+    st.session_state['settings_expanded'] = True
+
+if 'ingested_docs' not in st.session_state:
+    st.session_state['ingested_docs'] = {}
+
 add_thread(st.session_state['thread_id'])
 
 if 'editing_thread' not in st.session_state:
     st.session_state['editing_thread'] = None
+
+thread_key = str(st.session_state['thread_id'])
+thread_docs = st.session_state['ingested_docs'].setdefault(thread_key, {})
 
 # **************************************** Sidebar UI *********************************
 st.sidebar.title('SAM : Ai Chatbot')
 
 if st.sidebar.button('New Chat'):
     reset_chat()
+    st.rerun()
 
+# ---- PDF Upload ----
+st.sidebar.header('Document Upload')
+
+if thread_docs:
+    latest_doc = list(thread_docs.values())[-1]
+    st.sidebar.success(
+        f"PDF indexed: **{latest_doc.get('filename')}** "
+        f"({latest_doc.get('chunks')} chunks, {latest_doc.get('documents')} pages)"
+    )
+else:
+    st.sidebar.info("No PDF indexed for this chat.")
+
+uploaded_pdf = st.sidebar.file_uploader("Upload a PDF for RAG", type=["pdf"])
+if uploaded_pdf:
+    if uploaded_pdf.name in thread_docs:
+        st.sidebar.info(f"`{uploaded_pdf.name}` already processed for this chat.")
+    else:
+        with st.sidebar.status("Indexing PDF...", expanded=True) as status_box:
+            summary = ingest_pdf(
+                uploaded_pdf.getvalue(),
+                thread_id=thread_key,
+                filename=uploaded_pdf.name,
+            )
+            thread_docs[uploaded_pdf.name] = summary
+            status_box.update(label="PDF indexed successfully", state="complete", expanded=False)
+
+# ---- Conversations list ----
 st.sidebar.header('My Conversations')
 
 for thread_id in st.session_state['chat_threads'][::-1]:
     title = st.session_state['chat_titles'].get(thread_id, 'New Chat')
 
-    # ----- Rename mode for this thread -----
     if st.session_state['editing_thread'] == thread_id:
         new_title = st.sidebar.text_input(
             'Rename chat',
@@ -231,7 +269,6 @@ for thread_id in st.session_state['chat_threads'][::-1]:
             st.session_state['editing_thread'] = None
             st.rerun()
 
-    # ----- Normal mode: open chat + edit button -----
     else:
         open_col, edit_col = st.sidebar.columns([4, 1.5])
         if open_col.button(title, key=str(thread_id)):
@@ -242,6 +279,8 @@ for thread_id in st.session_state['chat_threads'][::-1]:
                 role = 'user' if isinstance(msg, HumanMessage) else 'assistant'
                 temp_messages.append({'role': role, 'content': msg.content})
             st.session_state['message_history'] = temp_messages
+            st.session_state['ingested_docs'].setdefault(str(thread_id), {})
+            st.rerun()
         if edit_col.button('Edit', key=f'edit_{thread_id}'):
             st.session_state['editing_thread'] = thread_id
             st.rerun()
@@ -279,7 +318,6 @@ else:
 
 
 # **************************************** Main UI ************************************
-# ---- Top-right info icons (click to reveal) ----
 _, loc_col, time_col = st.columns([8, 1, 1])
 
 with loc_col:
@@ -290,48 +328,23 @@ with loc_col:
 with time_col:
     with st.popover("", icon=":material/schedule:"):
         render_live_time()
-        
-
-# ---- Live clock (top-right) ----
-# @st.fragment(run_every="1s")
-# def render_clock():
-   # tz_name = st.session_state.get('user_timezone', 'Asia/Kolkata')
-    #now = datetime.now(ZoneInfo(tz_name))
-    #location = st.session_state.get('user_location', '').strip()
-    #date_str = now.strftime('%d %b %Y')
-    #time_str = now.strftime('%I:%M:%S %p')
-
-    #pin = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>'
-    #globe = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>'
-    #clock = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>'
-
-    #rows = ''
-   # if location:
-     #   rows += f'<div class="info-row">{pin}<span>{location}</span></div>'
-    #rows += f'<div class="info-row">{globe}<span>{tz_name}</span></div>'
-    #rows += f'<div class="info-row info-time">{clock}<span>{date_str}, {time_str}</span></div>'
-
-   # st.html(f'<div class="info-card">{rows}</div>')
-
-# render_clock()
-
 
 
 for message in st.session_state['message_history']:
     with st.chat_message(message['role']):
-        st.text(message['content'])
+        st.markdown(message['content'])
 
-user_input = st.chat_input('Type here')
+user_input = st.chat_input('Ask about your document, search the web, or run code')
 
 if user_input:
     st.session_state['message_history'].append({'role': 'user', 'content': user_input})
     with st.chat_message('user'):
-        st.text(user_input)
+        st.markdown(user_input)
 
     tz_name = st.session_state.get('user_timezone', 'Asia/Kolkata')
     CONFIG = {
         'configurable': {
-            'thread_id': st.session_state['thread_id'],
+            'thread_id': thread_key,
             'user_location': st.session_state.get('user_location', ''),
             'user_timezone': tz_name,
             'local_time': datetime.now(ZoneInfo(tz_name)).strftime('%A, %d %B %Y, %I:%M %p'),
@@ -339,21 +352,47 @@ if user_input:
     }
 
     with st.chat_message("assistant"):
+        status_holder = {"box": None}
+
         def ai_only_stream():
             for message_chunk, metadata in chatbot.stream(
                 {"messages": [HumanMessage(content=user_input)]},
                 config=CONFIG,
-                stream_mode="messages"
+                stream_mode="messages",
             ):
+                if isinstance(message_chunk, ToolMessage):
+                    tool_name = getattr(message_chunk, "name", "tool")
+                    if status_holder["box"] is None:
+                        status_holder["box"] = st.status(
+                            f"Using {tool_name}...", expanded=True
+                        )
+                    else:
+                        status_holder["box"].update(
+                            label=f"Using {tool_name}...",
+                            state="running",
+                            expanded=True,
+                        )
+
                 if isinstance(message_chunk, AIMessage):
                     yield message_chunk.content
 
         ai_message = st.write_stream(ai_only_stream())
 
+        if status_holder["box"] is not None:
+            status_holder["box"].update(
+                label="Tool finished", state="complete", expanded=False
+            )
+
     st.session_state['message_history'].append({'role': 'assistant', 'content': ai_message})
 
-    # **** NEW: title the chat from the first query->response pair, once ****
+    doc_meta = thread_document_metadata(thread_key)
+    if doc_meta:
+        st.caption(
+            f"Document indexed: {doc_meta.get('filename')} "
+            f"(chunks: {doc_meta.get('chunks')}, pages: {doc_meta.get('documents')})"
+        )
+
     current_thread = st.session_state['thread_id']
     if current_thread not in st.session_state['chat_titles']:
         st.session_state['chat_titles'][current_thread] = generate_title(user_input, ai_message)
-        st.rerun()   # refresh the sidebar so the new title appears immediately
+        st.rerun()
