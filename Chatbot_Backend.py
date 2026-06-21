@@ -1,12 +1,22 @@
-from langgraph.graph import StateGraph, START, END
-from typing import TypedDict, Annotated
-from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
-from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.graph.message import add_messages
-from dotenv import load_dotenv
+from __future__ import annotations
+
 import os
+import tempfile
+from typing import Annotated, Any, Dict, Optional, TypedDict
 from pathlib import Path
+
+from dotenv import load_dotenv
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_community.vectorstores import FAISS
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
 
@@ -17,8 +27,105 @@ if not os.getenv("OPENAI_API_KEY"):
     except Exception:
         pass
 
-llm = ChatOpenAI()
+# ---------------------------------------------------------------------------
+# LLM + Embeddings
+# ---------------------------------------------------------------------------
+llm = ChatOpenAI(model="gpt-4o-mini")
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
+# ---------------------------------------------------------------------------
+# Per-thread PDF retriever store
+# ---------------------------------------------------------------------------
+_THREAD_RETRIEVERS: Dict[str, Any] = {}
+_THREAD_METADATA: Dict[str, dict] = {}
+
+
+def _get_retriever(thread_id: Optional[str]):
+    if thread_id and thread_id in _THREAD_RETRIEVERS:
+        return _THREAD_RETRIEVERS[thread_id]
+    return None
+
+
+def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None) -> dict:
+    if not file_bytes:
+        raise ValueError("No bytes received for ingestion.")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(file_bytes)
+        temp_path = tmp.name
+
+    try:
+        loader = PyPDFLoader(temp_path)
+        docs = loader.load()
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000, chunk_overlap=200, separators=["\n\n", "\n", " ", ""]
+        )
+        chunks = splitter.split_documents(docs)
+
+        vector_store = FAISS.from_documents(chunks, embeddings)
+        retriever = vector_store.as_retriever(
+            search_type="similarity", search_kwargs={"k": 4}
+        )
+
+        tid = str(thread_id)
+        _THREAD_RETRIEVERS[tid] = retriever
+        _THREAD_METADATA[tid] = {
+            "filename": filename or os.path.basename(temp_path),
+            "documents": len(docs),
+            "chunks": len(chunks),
+        }
+        return _THREAD_METADATA[tid]
+    finally:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+
+
+def thread_has_document(thread_id: str) -> bool:
+    return str(thread_id) in _THREAD_RETRIEVERS
+
+
+def thread_document_metadata(thread_id: str) -> dict:
+    return _THREAD_METADATA.get(str(thread_id), {})
+
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+search_tool = DuckDuckGoSearchRun(region="us-en")
+
+
+@tool
+def rag_tool(query: str, thread_id: Optional[str] = None) -> dict:
+    """Retrieve relevant information from the uploaded PDF for this chat thread.
+    Always include the thread_id when calling this tool."""
+    retriever = _get_retriever(thread_id)
+    if retriever is None:
+        return {
+            "error": "No document indexed for this chat. Upload a PDF first.",
+            "query": query,
+        }
+
+    result = retriever.invoke(query)
+    context = [doc.page_content for doc in result]
+    metadata = [doc.metadata for doc in result]
+
+    return {
+        "query": query,
+        "context": context,
+        "metadata": metadata,
+        "source_file": _THREAD_METADATA.get(str(thread_id), {}).get("filename"),
+    }
+
+
+tools = [search_tool, rag_tool]
+llm_with_tools = llm.bind_tools(tools)
+
+# ---------------------------------------------------------------------------
+# Title generation (unchanged)
+# ---------------------------------------------------------------------------
 def generate_title(user_msg: str, ai_msg: str) -> str:
     prompt = [
         SystemMessage(content=(
@@ -33,39 +140,81 @@ def generate_title(user_msg: str, ai_msg: str) -> str:
     title = result.content.strip().strip('"').strip()
     return title or "New Chat"
 
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 
-def chat_node(state: ChatState, config):
-    messages = state['messages']
 
-    cfg = config.get('configurable', {}) if config else {}
-    location = cfg.get('user_location')
-    timezone = cfg.get('user_timezone')
-    local_time = cfg.get('local_time')
+# ---------------------------------------------------------------------------
+# Nodes
+# ---------------------------------------------------------------------------
+SYSTEM_PROMPT = (
+    "You are SAM, a helpful multi-utility AI assistant. You have the following capabilities:\n"
+    "\n"
+    "1. **PDF Q&A (RAG)**: When a PDF has been uploaded, use the `rag_tool` (always pass "
+    "the thread_id `{thread_id}`) to retrieve relevant passages before answering. "
+    "If no document is available and the user asks about one, ask them to upload a PDF.\n"
+    "\n"
+    "2. **Web Search**: Use the `duckduckgo_search` tool to look up current information, "
+    "recent events, or anything not in your training data.\n"
+    "\n"
+    "3. **Code Interpreter**: You can write, explain, debug, and execute Python code. "
+    "When the user asks you to run code, write the code in a fenced ```python block, "
+    "walk through its execution step by step, and provide the final output. "
+    "For calculations, data transformations, or algorithmic questions, prefer writing "
+    "and tracing code over prose explanations.\n"
+)
 
-    bits = []
+
+def chat_node(state: ChatState, config=None):
+    cfg = config.get("configurable", {}) if config else {}
+    thread_id = cfg.get("thread_id")
+    location = cfg.get("user_location")
+    timezone = cfg.get("user_timezone")
+    local_time = cfg.get("local_time")
+
+    context_bits = []
     if location:
-        bits.append(f"The user's location is {location}.")
+        context_bits.append(f"The user's location is {location}.")
     if timezone:
-        bits.append(f"The user's time zone is {timezone}.")
+        context_bits.append(f"The user's time zone is {timezone}.")
     if local_time:
-        bits.append(f"The user's current local date and time is {local_time}.")
+        context_bits.append(f"The user's current local date and time is {local_time}.")
 
-    if bits:
-        system_msg = SystemMessage(content="User context (use when relevant): " + " ".join(bits))
-        response = llm.invoke([system_msg] + messages)
-    else:
-        response = llm.invoke(messages)
+    has_doc = thread_has_document(thread_id) if thread_id else False
+    if has_doc:
+        meta = thread_document_metadata(thread_id)
+        context_bits.append(
+            f"A PDF is indexed for this chat: \"{meta.get('filename')}\" "
+            f"({meta.get('chunks')} chunks, {meta.get('documents')} pages)."
+        )
 
+    system_text = SYSTEM_PROMPT.format(thread_id=thread_id or "unknown")
+    if context_bits:
+        system_text += "\nUser context: " + " ".join(context_bits)
+
+    system_msg = SystemMessage(content=system_text)
+    messages = [system_msg, *state["messages"]]
+    response = llm_with_tools.invoke(messages, config=config)
     return {"messages": [response]}
 
-# Checkpointer
+
+tool_node = ToolNode(tools)
+
+# ---------------------------------------------------------------------------
+# Checkpointer + Graph
+# ---------------------------------------------------------------------------
 checkpointer = InMemorySaver()
 
 graph = StateGraph(ChatState)
 graph.add_node("chat_node", chat_node)
+graph.add_node("tools", tool_node)
+
 graph.add_edge(START, "chat_node")
-graph.add_edge("chat_node", END)
+graph.add_conditional_edges("chat_node", tools_condition)
+graph.add_edge("tools", "chat_node")
 
 chatbot = graph.compile(checkpointer=checkpointer)
