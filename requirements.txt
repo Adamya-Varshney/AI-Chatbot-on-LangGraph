@@ -5,6 +5,7 @@ langchain-core
 langchain-openai
 langchain-community
 python-dotenv
+langchain-text-splitters
 faiss-cpu
 pypdf
 duckduckgo-search
